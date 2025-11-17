@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 
 namespace kaeruSong
@@ -12,13 +12,14 @@ namespace kaeruSong
             return Math.Sin(Math.PI * x) / (Math.PI * x);
         }
 
-        // Hann window
-        private static double[] Hann(int length)
+        // ハン窓（0..N-1）
+        private static double[] Hann(int N)
         {
-            var w = new double[length];
-            for (int i = 0; i < length; i++)
+            var w = new double[N];
+            // 端点を含む標準ハン窓
+            for (int n = 0; n < N; n++)
             {
-                w[i] = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * i / (length - 1));
+                w[n] = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * n / (N - 1));
             }
             return w;
         }
@@ -61,86 +62,156 @@ namespace kaeruSong
             return autocorr;
         }
 
-        public static int GetPeriod(double[] waveData, int periodMin, int periodMax, int corrSize)
+        // 自己相関に基づく周期推定（配列コピーなし・オフセット指定）
+        private static int GetPeriod(double[] x, int inPos, int minP, int maxP, int corrSize)
         {
-            double corrMax = 0.0;
-            int period = periodMin;
+            int nSamples = x.Length;
 
-            for (int p = periodMin; p < periodMax; p++)
+            // 参照窓の有効長（末尾を越えないように）
+            int refLen = Math.Min(corrSize, nSamples - inPos - maxP);
+            if (refLen <= 0) return minP;
+
+            // 参照窓エネルギー
+            double E0 = 0.0;
+            for (int n = 0; n < refLen; n++)
+                E0 += x[inPos + n] * x[inPos + n];
+
+            double best = double.NegativeInfinity;
+            int bestLag = minP;
+
+            for (int p = minP; p <= maxP; p++)
             {
-                double corr = CalcAutocorr(waveData, corrSize, p);
-                if (corr > corrMax)
+                double num = 0.0, E1 = 0.0;
+                int baseB = inPos + p;
+
+                for (int n = 0; n < refLen; n++)
                 {
-                    corrMax = corr;
-                    period = p;
+                    double a = x[inPos + n];
+                    double b = x[baseB + n];
+                    num += a * b;
+                    E1 += b * b;
+                }
+
+                double denom = Math.Sqrt(E0 * E1) + 1e-12;
+                double r = num / denom; // 正規化相関
+
+                if (r > best)
+                {
+                    best = r;
+                    bestLag = p;
                 }
             }
-            return period;
+
+            return bestLag;
         }
 
-        public static double[] TimeStretch(double[] dataIn, int fs, double rate)
+        public static double[] TimeStretch(double[] x, int fs, double rate)
         {
-            int nSamples = dataIn.Length;
-            int corrSize = (int)(fs * 0.01);   // 10ms
-            int minPeriod = (int)(fs * 0.005); // 5ms
-            int maxPeriod = (int)(fs * 0.02);  // 20ms
+            ArgumentNullException.ThrowIfNull(x);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(fs);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(rate);
 
-            int offsetIn = 0;
-            int offsetOut = 0;
+            int corrSize = Math.Max(1, (int)Math.Round(fs * 0.01)); // 30ms
+            int minPeriod = Math.Max(1, (int)Math.Round(fs * 0.005)); // 5ms
+            int maxPeriod = Math.Max(minPeriod + 1, (int)Math.Round(fs * 0.02)); // 20ms以上
+            if (x.Length == 0) return Array.Empty<double>();
+            if (Math.Abs(rate - 1.0) < 1e-12) // レート=1はそのまま返す
+                return (double[])x.Clone();
 
-            var dataOut = new double[(int)(nSamples / rate) + 1];
+            Array.Resize(ref x, x.Length + 2 * maxPeriod); // 最後目で変換されるように配列の最後に0を追加する
+            int nSamples = x.Length;
 
-            while (offsetIn + maxPeriod * 2 < nSamples)
+            // 出力長は「安全側」へ。最後にトリムする。
+            int maxOutLen = (int)Math.Ceiling(nSamples / Math.Max(rate, 1e-6)) + maxPeriod * 2 + 8;
+            var y = new double[maxOutLen];
+
+            int inPos = 0;
+            int outPos = 0;
+
+            while (inPos + 2 * maxPeriod < nSamples && outPos + 2 * maxPeriod < y.Length)
             {
-                int period = GetPeriod(dataIn.Skip(offsetIn).ToArray(), minPeriod, maxPeriod, corrSize);
+                int period = GetPeriod(x, inPos, minPeriod, maxPeriod, corrSize);
 
-                if (rate >= 1.0) // fast
+                int L = period;
+                var w = Hann(2 * L);
+
+                if (rate >= 1.0)
                 {
-                    var window = Hann(2 * period);
-                    for (int n = 0; n < period; n++)
+                    // 2フレームをハン窓で重ねて L サンプル分出力
+                    for (int n = 0; n < L; n++)
                     {
-                        dataOut[offsetOut + n] =
-                            dataIn[offsetIn + n] * window[period + n] +
-                            dataIn[offsetIn + period + n] * window[n];
+                        int inA = inPos + n;
+                        int inB = inPos + L + n;
+                        int outIdx = outPos + n;
+
+                        if (inA >= nSamples || inB >= nSamples || outIdx >= y.Length) break;
+
+                        y[outIdx] = x[inA] * w[L + n] + x[inB] * w[n];
                     }
 
-                    int q = (int)(period / (rate - 1.0) + 0.5);
-                    for (int n = period; n < nSamples; n++)
+                    // rate>1: スキップ量 q を計算（間引き）
+                    int q = (int)Math.Round(L / (rate - 1.0));
+                    // 次の L の後ろに q サンプルをコピー（間を詰める）
+                    for (int n = 0; n < q; n++)
                     {
-                        if (n >= q) break;
-                        if (offsetIn + period + n >= nSamples) break;
-                        dataOut[offsetOut + n] = dataIn[offsetIn + period + n];
+                        int inIdx = inPos + L + n;
+                        int outIdx = outPos + L + n;
+                        if (inIdx >= nSamples || outIdx >= y.Length) break;
+
+                        y[outIdx] = x[inIdx];
                     }
 
-                    offsetIn += period + q;
-                    offsetOut += q;
+                    inPos += L + q;
+                    //outPos += L + q;
+                    outPos += q;
                 }
-                else // slow
+                else
                 {
-                    Array.Copy(dataIn, offsetIn, dataOut, offsetOut, period);
-
-                    var window = Hann(2 * period);
-                    for (int n = 0; n < period; n++)
+                    // rate<1: まず L サンプルそのまま出力（伸長の基礎）
+                    for (int n = 0; n < L; n++)
                     {
-                        dataOut[offsetOut + period + n] =
-                            dataIn[offsetIn + n] * window[n] +
-                            dataIn[offsetIn + period + n] * window[period + n];
+                        int inIdx = inPos + n;
+                        int outIdx = outPos + n;
+                        if (inIdx >= nSamples || outIdx >= y.Length) break;
+
+                        y[outIdx] = x[inIdx];
                     }
 
-                    int q = (int)(period * rate / (1.0 - rate) + 0.5);
-                    for (int n = period; n < nSamples; n++)
+                    // 次に 2 つのフレームをハン窓で重ねて L サンプル追記（重複生成）
+                    for (int n = 0; n < L; n++)
                     {
-                        if (n >= q) break;
-                        if (offsetIn + period + n >= nSamples) break;
-                        dataOut[offsetOut + period + n] = dataIn[offsetIn + n];
+                        int inA = inPos + n;
+                        int inB = inPos + L + n;
+                        int outIdx = outPos + L + n;
+
+                        if (inA >= nSamples || inB >= nSamples || outIdx >= y.Length) break;
+
+                        y[outIdx] = x[inA] * w[n] + x[inB] * w[L + n];
                     }
 
-                    offsetIn += q;
-                    offsetOut += period + q;
+                    // 追加の繰り返し量 q を計算（伸ばす）
+                    //int q = (int)(period * rate / (1.0 - rate) + 0.5);
+                    int q = (int)Math.Round(L * rate / (1.0 - rate));
+                    //int q = (int)Math.Round(L  / rate) - 1;
+                    for (int n = 0; n < q; n++)
+                    {
+                        int inIdx = inPos + n;
+                        int outIdx = outPos + 2 * L + n;
+                        if (inIdx >= nSamples || outIdx >= y.Length) break;
+
+                        y[outIdx] = x[inIdx];
+                    }
+
+                    inPos += q;
+                    //outPos += 2 * L + q;
+                    outPos += L + q;
                 }
             }
 
-            return dataOut;
+            // 実長へトリム
+            if (outPos <= 0) return Array.Empty<double>();
+            Array.Resize(ref y, outPos);
+            return y;
         }
 
         public static double[] PitchShift(double[] signal, int sampleRate, double pitch, int nTerm)
